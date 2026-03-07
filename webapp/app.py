@@ -41,6 +41,10 @@ def load_sample_data():
     try:
         # 尝试读取示例数据文件
         sample_data = pd.read_csv('../data/btcusd_1-min_data.csv')
+        if len(sample_data) == 0:
+            raise ValueError("示例数据文件为空")
+        elif len(sample_data) > 1000000:
+            sample_data = sample_data[1000000:]
         return sample_data
     except:
         # 如果文件不存在，创建一个示例数据

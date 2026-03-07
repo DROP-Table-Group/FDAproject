@@ -2,10 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+*.csv
 # C extensions
 *.so
-
+*.png
 # Distribution / packaging
 .Python
 build/
@@ -64,7 +64,7 @@ db.sqlite3-journal
 # Flask stuff:
 instance/
 .webassets-cache
-
+*.zip
 # Scrapy stuff:
 .scrapy
 
