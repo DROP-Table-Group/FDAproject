@@ -33,13 +33,17 @@ class HARDataProcessor:
         """
         
         # --- A. 标签生成 (Target Generation) ---
+        # 多任务学习：回归任务预测下一天的RV值，分类任务预测波动率是否下降
         # 论文公式 (2): RVD = 1 if RV_t < RV_{t-1} else 0
         # 也就是预测 "今天" 相对于 "昨天" 是涨还是跌
         # 注意：这里的 Label 是对应 index t 的
         rv = self.raw_df[self.target_col]
+        # 回归标签：下一天的RV值 (t时刻)
+        reg_labels = rv.values  # 形状: (N,)
+        # 分类标签：如果 RV_t < RV_{t-1} 则标签为1 (波动率下降)
         # diff = RV_t - RV_{t-1}
         # 如果 diff < 0 (波动率下降), label = 1
-        labels = (rv.diff() < 0).astype(int)
+        cls_labels = (rv.diff() < 0).astype(int).values  # 形状: (N,)
         
         # --- B. 特征图像构造 (Image Construction) ---
         # 图像结构: (N, 16 features, 16 time_windows)
@@ -70,14 +74,17 @@ class HARDataProcessor:
         valid_mask = ~np.isnan(X_all).any(axis=(1, 2))
         
         X_valid = X_all[valid_mask]
-        y_valid = labels.iloc[valid_mask].values # 对齐索引
-        
+        # 对齐回归和分类标签的索引
+        reg_valid = reg_labels[valid_mask]  # 形状: (N_valid,)
+        cls_valid = cls_labels[valid_mask]  # 形状: (N_valid,)
+
         # --- D. 划分训练/测试集 (Time Series Split) ---
         # 金融数据不能随机打乱 (Shuffle)，必须按时间切分
         split_idx = int(len(X_valid) * (1 - self.test_ratio))
-        
+
         X_train, X_test = X_valid[:split_idx], X_valid[split_idx:]
-        y_train, y_test = y_valid[:split_idx], y_valid[split_idx:]
+        reg_train, reg_test = reg_valid[:split_idx], reg_valid[split_idx:]
+        cls_train, cls_test = cls_valid[:split_idx], cls_valid[split_idx:]
         
         # --- E. 归一化 (Normalization) ---
         # CNN 对数值幅度敏感。我们需要对图像进行标准化。
@@ -90,14 +97,23 @@ class HARDataProcessor:
         # 论文推荐做法通常是按 Feature 类型标准化。
         
         X_train_norm, X_test_norm = self._normalize_by_feature(X_train, X_test)
-        
+
+        # 回归标签标准化 (仅使用训练集拟合)
+        reg_scaler = StandardScaler()
+        reg_train_norm = reg_scaler.fit_transform(reg_train.reshape(-1, 1)).flatten()
+        reg_test_norm = reg_scaler.transform(reg_test.reshape(-1, 1)).flatten()
+
         # 增加 Channel 维度适配 PyTorch Conv2d: (N, 1, 16, 16)
         X_train_norm = X_train_norm[:, np.newaxis, :, :]
         X_test_norm = X_test_norm[:, np.newaxis, :, :]
-        
+
         return {
-            'X_train': X_train_norm, 'y_train': y_train,
-            'X_test': X_test_norm,   'y_test': y_test
+            'X_train': X_train_norm,
+            'y_reg_train': reg_train_norm,   # 标准化后的回归标签
+            'y_cls_train': cls_train,        # 分类标签 (0/1)
+            'X_test': X_test_norm,
+            'y_reg_test': reg_test_norm,     # 标准化后的回归标签
+            'y_cls_test': cls_test           # 分类标签 (0/1)
         }
 
     def _normalize_by_feature(self, train, test):
@@ -130,20 +146,24 @@ class HARDataProcessor:
 # 2. PyTorch Dataset 定义
 # ==========================================
 class FinancialImageDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y_reg, y_cls):
         """
         X: numpy array (N, 1, 16, 16)
-        y: numpy array (N,)
+        y_reg: numpy array (N,) 标准化后的回归标签
+        y_cls: numpy array (N,) 分类标签 (0/1)
         """
         self.X = torch.tensor(X, dtype=torch.float32)
-        # Classification 需要 Long 类型标签
-        self.y = torch.tensor(y, dtype=torch.long)
-        
+        # 回归标签需要 Float 类型
+        self.y_reg = torch.tensor(y_reg, dtype=torch.float32)
+        # 分类标签需要 Long 类型
+        self.y_cls = torch.tensor(y_cls, dtype=torch.long)
+
     def __len__(self):
         return len(self.X)
-    
+
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        # 返回三个元素：图像、回归标签、分类标签
+        return self.X[idx], self.y_reg[idx], self.y_cls[idx]
 
 # ==========================================
 # 3. 辅助函数: 创建 DataLoaders
@@ -155,11 +175,19 @@ def create_dataloaders(daily_df, batch_size=32, test_ratio=0.2):
     
     print(f"Train shape: {data_dict['X_train'].shape}")
     print(f"Test shape:  {data_dict['X_test'].shape}")
-    
+
     # 2. 创建 Dataset 实例
-    train_dataset = FinancialImageDataset(data_dict['X_train'], data_dict['y_train'])
-    test_dataset = FinancialImageDataset(data_dict['X_test'], data_dict['y_test'])
-    
+    train_dataset = FinancialImageDataset(
+        data_dict['X_train'],
+        data_dict['y_reg_train'],
+        data_dict['y_cls_train']
+    )
+    test_dataset = FinancialImageDataset(
+        data_dict['X_test'],
+        data_dict['y_reg_test'],
+        data_dict['y_cls_test']
+    )
+
     # 3. 创建 DataLoader
     # 训练集可以 shuffle，测试集通常不 shuffle (方便画时序图，虽然分类问题无所谓)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
