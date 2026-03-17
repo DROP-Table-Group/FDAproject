@@ -3,6 +3,10 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 
 
 class MultiTaskLoss(nn.Module):
@@ -151,8 +155,8 @@ def train_model(model, train_loader, test_loader, num_epochs=50, device='cpu'):
             running_cls_bce += loss_components['bce'] * batch_size
 
             # 分类准确率计算
-            cls_pred = (torch.sigmoid(cls_output) > 0.5).long().squeeze()
-            correct_train += (cls_pred == y_cls).sum().item()
+            cls_pred = (torch.sigmoid(cls_output).view(-1) > 0.5).long()
+            correct_train += (cls_pred == y_cls.view(-1)).sum().item()
             total_train += batch_size
 
         # 计算平均指标
@@ -218,8 +222,8 @@ def evaluate_model(model, data_loader, criterion, device):
             running_cls_bce += loss_components['bce'] * batch_size
 
             # 分类准确率
-            cls_pred = (torch.sigmoid(cls_output) > 0.5).long().squeeze()
-            correct += (cls_pred == y_cls).sum().item()
+            cls_pred = (torch.sigmoid(cls_output).view(-1) > 0.5).long()
+            correct += (cls_pred == y_cls.view(-1)).sum().item()
             total += batch_size
 
     avg_loss = running_loss / len(data_loader.dataset)
@@ -233,6 +237,101 @@ def evaluate_model(model, data_loader, criterion, device):
         'cls_bce': avg_cls_bce,
         'cls_acc': accuracy
     }
+
+
+def export_test_predictions(
+    model,
+    test_loader,
+    metadata,
+    device='cpu',
+    benchmark_path=None,
+    output_path=None,
+):
+    """
+    导出测试集上的回归预测和分类结果，并按基准文件日期对齐。
+    """
+    if metadata is None:
+        raise ValueError("metadata 不能为空，需包含测试集日期和回归标签的 scaler。")
+
+    required_keys = {'test_dates', 'y_reg_test_raw', 'y_cls_test', 'reg_scaler'}
+    missing_keys = required_keys.difference(metadata)
+    if missing_keys:
+        raise ValueError(f"metadata 缺少必要字段: {sorted(missing_keys)}")
+
+    model = model.to(device)
+    model.eval()
+
+    reg_predictions = []
+    cls_logits = []
+    cls_probabilities = []
+    cls_predictions = []
+
+    with torch.no_grad():
+        for images, _, _ in test_loader:
+            images = images.to(device)
+            reg_output, cls_output = model(images)
+
+            reg_predictions.append(reg_output.view(-1).cpu().numpy())
+
+            batch_logits = cls_output.view(-1).cpu().numpy()
+            batch_probabilities = torch.sigmoid(cls_output).view(-1).cpu().numpy()
+
+            cls_logits.append(batch_logits)
+            cls_probabilities.append(batch_probabilities)
+            cls_predictions.append((batch_probabilities > 0.5).astype(int))
+
+    reg_predictions = np.concatenate(reg_predictions)
+    cls_logits = np.concatenate(cls_logits)
+    cls_probabilities = np.concatenate(cls_probabilities)
+    cls_predictions = np.concatenate(cls_predictions)
+
+    reg_scaler = metadata['reg_scaler']
+    reg_predictions_raw = reg_scaler.inverse_transform(reg_predictions.reshape(-1, 1)).ravel()
+
+    test_dates = pd.to_datetime(metadata['test_dates'])
+    true_rv = np.asarray(metadata['y_reg_test_raw'])
+    true_cls = np.asarray(metadata['y_cls_test'])
+
+    if len(test_dates) != len(reg_predictions_raw):
+        raise ValueError(
+            f"测试集日期数量 ({len(test_dates)}) 与预测数量 ({len(reg_predictions_raw)}) 不一致。"
+        )
+
+    prediction_frame = pd.DataFrame(
+        {
+            'date': test_dates,
+            'true_rv': true_rv,
+            'cnn_pred': reg_predictions_raw,
+            'true_cls': true_cls,
+            'cnn_cls_logit': cls_logits,
+            'cnn_cls_prob': cls_probabilities,
+            'cnn_cls_pred': cls_predictions,
+        }
+    )
+    prediction_frame['date'] = prediction_frame['date'].dt.normalize()
+
+    if benchmark_path is not None:
+        benchmark_frame = pd.read_csv(benchmark_path, parse_dates=['date'])
+        benchmark_frame['date'] = pd.to_datetime(benchmark_frame['date']).dt.normalize()
+
+        aligned_frame = benchmark_frame[['date', 'true_rv']].merge(
+            prediction_frame.drop(columns=['true_rv']),
+            on='date',
+            how='inner',
+            sort=False,
+        )
+
+        if aligned_frame.empty:
+            raise ValueError("CNN 测试集日期与 benchmark_predictions.csv 没有重叠区间。")
+    else:
+        aligned_frame = prediction_frame.copy()
+
+    if output_path is not None:
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        aligned_frame.to_csv(output_file, index=False)
+
+    return aligned_frame
 # 实例化并打印模型结构以验证
 if __name__ == "__main__":
     model = CNN_HAR_KS()

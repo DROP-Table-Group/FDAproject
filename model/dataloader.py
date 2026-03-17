@@ -3,12 +3,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from typing import Literal, overload
 
 # ==========================================
 # 1. 核心数据处理逻辑 (Pandas -> Numpy)
 # ==========================================
 class HARDataProcessor:
-    def __init__(self, daily_df, target_col='RV', test_ratio=0.2):
+    def __init__(self, daily_df, target_col='RV', test_ratio=0.2, test_start_date=None):
         """
         daily_df: 包含16个HAR组件的日度DataFrame
         target_col: 用于计算标签的基础列 (通常是 RV)
@@ -17,6 +18,8 @@ class HARDataProcessor:
         self.raw_df = daily_df.copy()
         self.target_col = target_col
         self.test_ratio = test_ratio
+        self.raw_df.index = pd.to_datetime(self.raw_df.index)
+        self.test_start_date = pd.to_datetime(test_start_date) if test_start_date is not None else None
         
         # 确保列的顺序固定 (16个特征)
         # 这一步很重要，这决定了图像的"高度" (Height) 对应的特征含义
@@ -72,6 +75,7 @@ class HARDataProcessor:
         # --- C. 数据清洗 (Drop NaN) ---
         # 因为做了 shift(1) 和 rolling(20)，前21行会有 NaN
         valid_mask = ~np.isnan(X_all).any(axis=(1, 2))
+        valid_dates = self.raw_df.index[valid_mask]
         
         X_valid = X_all[valid_mask]
         # 对齐回归和分类标签的索引
@@ -80,11 +84,19 @@ class HARDataProcessor:
 
         # --- D. 划分训练/测试集 (Time Series Split) ---
         # 金融数据不能随机打乱 (Shuffle)，必须按时间切分
-        split_idx = int(len(X_valid) * (1 - self.test_ratio))
+        if self.test_start_date is not None:
+            split_idx = valid_dates.searchsorted(self.test_start_date, side='left')
+            if split_idx <= 0 or split_idx >= len(X_valid):
+                raise ValueError(
+                    f"test_start_date={self.test_start_date.date()} 不在有效样本区间内，无法切分训练/测试集。"
+                )
+        else:
+            split_idx = int(len(X_valid) * (1 - self.test_ratio))
 
         X_train, X_test = X_valid[:split_idx], X_valid[split_idx:]
         reg_train, reg_test = reg_valid[:split_idx], reg_valid[split_idx:]
         cls_train, cls_test = cls_valid[:split_idx], cls_valid[split_idx:]
+        train_dates, test_dates = valid_dates[:split_idx], valid_dates[split_idx:]
         
         # --- E. 归一化 (Normalization) ---
         # CNN 对数值幅度敏感。我们需要对图像进行标准化。
@@ -113,7 +125,12 @@ class HARDataProcessor:
             'y_cls_train': cls_train,        # 分类标签 (0/1)
             'X_test': X_test_norm,
             'y_reg_test': reg_test_norm,     # 标准化后的回归标签
-            'y_cls_test': cls_test           # 分类标签 (0/1)
+            'y_cls_test': cls_test,          # 分类标签 (0/1)
+            'y_reg_train_raw': reg_train,
+            'y_reg_test_raw': reg_test,
+            'train_dates': train_dates,
+            'test_dates': test_dates,
+            'reg_scaler': reg_scaler
         }
 
     def _normalize_by_feature(self, train, test):
@@ -168,9 +185,31 @@ class FinancialImageDataset(Dataset):
 # ==========================================
 # 3. 辅助函数: 创建 DataLoaders
 # ==========================================
-def create_dataloaders(daily_df, batch_size=32, test_ratio=0.2):
+@overload
+def create_dataloaders(
+    daily_df,
+    batch_size=32,
+    test_ratio=0.2,
+    return_metadata: Literal[False] = False,
+    test_start_date=None,
+):
+    ...
+
+
+@overload
+def create_dataloaders(
+    daily_df,
+    batch_size=32,
+    test_ratio=0.2,
+    return_metadata: Literal[True] = True,
+    test_start_date=None,
+):
+    ...
+
+
+def create_dataloaders(daily_df, batch_size=32, test_ratio=0.2, return_metadata=False, test_start_date=None):
     # 1. 处理数据
-    processor = HARDataProcessor(daily_df, test_ratio=test_ratio)
+    processor = HARDataProcessor(daily_df, test_ratio=test_ratio, test_start_date=test_start_date)
     data_dict = processor.process()
     
     print(f"Train shape: {data_dict['X_train'].shape}")
@@ -193,6 +232,18 @@ def create_dataloaders(daily_df, batch_size=32, test_ratio=0.2):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
+    if return_metadata:
+        metadata = {
+            'train_dates': pd.to_datetime(data_dict['train_dates']),
+            'test_dates': pd.to_datetime(data_dict['test_dates']),
+            'y_reg_train_raw': data_dict['y_reg_train_raw'],
+            'y_reg_test_raw': data_dict['y_reg_test_raw'],
+            'y_cls_train': data_dict['y_cls_train'],
+            'y_cls_test': data_dict['y_cls_test'],
+            'reg_scaler': data_dict['reg_scaler'],
+        }
+        return train_loader, test_loader, metadata
+
     return train_loader, test_loader
 
 # ==========================================
@@ -221,12 +272,14 @@ if __name__ == "__main__":
     train_dl, test_dl = create_dataloaders(df_daily_har, batch_size=64)
     
     # --- 检查一个 Batch ---
-    images, labels = next(iter(train_dl))
+    images, y_reg, y_cls = next(iter(train_dl))
     
     print("\nBatch 信息:")
     print(f"Image Batch Shape: {images.shape}") # 预期: [64, 1, 16, 16]
-    print(f"Label Batch Shape: {labels.shape}") # 预期: [64]
-    print(f"Label Example: {labels[:5]}")
+    print(f"Regression Label Shape: {y_reg.shape}")
+    print(f"Classification Label Shape: {y_cls.shape}")
+    print(f"Regression Label Example: {y_reg[:5]}")
+    print(f"Classification Label Example: {y_cls[:5]}")
     
     # 这就是可以直接喂给 CNN 模型 (forward) 的数据了
     # model(images) -> output
