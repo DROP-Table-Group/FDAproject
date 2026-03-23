@@ -1,0 +1,8 @@
+{
+  "learning_rate": 0.006292409204267483,
+  "weight_decay": 2.9046011346539613e-05,
+  "dropout": 0.1,
+  "fc1_dim": 107,
+  "batch_size": 16,
+  "test_loss": 0.691429313406189
+}
