@@ -9,98 +9,147 @@ import numpy as np
 import pandas as pd
 
 
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.act1 = Swish()
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.se = SEBlock(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.act1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = self.act1(out) 
+        return out
+
+
 class MultiTaskLoss(nn.Module):
     def __init__(self):
         super(MultiTaskLoss, self).__init__()
-        # 定义两个可学习的参数 (log variance)
-        self.log_vars = nn.Parameter(torch.zeros(2))
 
     def forward(self, pred_reg, true_reg, pred_cls, true_cls):
-        # 回归任务：均方误差损失
-        mse = nn.MSELoss()(pred_reg.squeeze(), true_reg)
+        # 回归任务：Huber Loss (SmoothL1Loss) for robustness
+        # 使用 SmoothL1Loss作为Huber Loss的替代 (beta=1.0)
+        reg_loss = F.smooth_l1_loss(pred_reg.squeeze(), true_reg, reduction='mean')
+        
+        # 记录MSE用于评估指标
+        mse_for_log = F.mse_loss(pred_reg.squeeze(), true_reg, reduction='mean')
+        
         # 分类任务：二元交叉熵损失（使用logits）
         # true_cls需要转换为float类型用于BCEWithLogitsLoss
-        bce = nn.BCEWithLogitsLoss()(pred_cls.squeeze(), true_cls.float())
+        bce = F.binary_cross_entropy_with_logits(pred_cls.squeeze(), true_cls.float(), reduction='mean')
 
-        # 这里的公式推导来自于贝叶斯深度学习
-        # 简单理解：如果某个任务很难（Loss大），模型会自动增大分母(var)来降低该任务对总Loss的贡献
-        loss = (0.5 * torch.exp(-self.log_vars[0]) * mse + 0.5 * self.log_vars[0]) + \
-               (torch.exp(-self.log_vars[1]) * bce + 0.5 * self.log_vars[1])
+        # Using fixed weights. 
+        loss = reg_loss + 0.1 * bce
 
-        return loss, {'mse': mse.item(), 'bce': bce.item(), 'log_var_reg': self.log_vars[0].item(), 'log_var_cls': self.log_vars[1].item()}
+        return loss, {'mse': mse_for_log.item(), 'bce': bce.item(), 'log_var_reg': 0.0, 'log_var_cls': 0.0}
 
 
 class CNN_HAR_KS(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout=0.1, fc1_dim=128):
+        """
+        Advanced CNN-HAR-KS with Residual connections, SE-Block, and Swish activation.
+        Default values are set to the best parameters found via Bayesian Optimization:
+        dropout=0.1, fc1_dim=128.
+        """
         super(CNN_HAR_KS, self).__init__()
         
-        # --- Layer 1: Convolution ---
-        # Input: (Batch, 1, 16, 16)
-        # Output: (Batch, 32, 16, 16)
-        # Padding=1 ensures the size remains 16x16 with a 3x3 kernel
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1)
-        self.relu1 = nn.ReLU()
+        # --- Layer 1: Initial Convolution ---
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.act1 = Swish()
         
-        # --- Layer 2: Convolution ---
-        # Input: (Batch, 32, 16, 16)
-        # Output: (Batch, 64, 16, 16)
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        self.relu2 = nn.ReLU()
+        # --- Layer 2-4: Residual Blocks ---
+        # 16x16 -> 8x8 (Downsampling, 32->64)
+        self.layer1 = ResidualBlock(32, 64, stride=2)
         
-        # --- Layer 3: Max Pooling ---
-        # Input: (Batch, 64, 16, 16)
-        # Output: (Batch, 64, 8, 8) -> Flat features: 64 * 8 * 8 = 4096
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        # 8x8 -> 8x8 (Keep size, 64->64)
+        self.layer2 = ResidualBlock(64, 64, stride=1)
         
-        # --- Layer 4: Dropout ---
-        # Paper Appendix C: Dropout = 0.3
-        self.dropout = nn.Dropout(p=0.3)
+        # 8x8 -> 4x4 (Downsampling, 64->128)
+        self.layer3 = ResidualBlock(64, 128, stride=2)
+        
+        self.dropout = nn.Dropout(p=dropout)
         
         # --- Layer 5: Fully Connected (MLP) ---
-        # Input: 4096 flattened features
-        # Output: 64
-        self.fc1 = nn.Linear(64 * 8 * 8, 64)
-        self.relu3 = nn.ReLU()
+        # Input: 128 * 4 * 4 = 2048 flattened features
+        self.flat_dim = 128 * 4 * 4
+        self.fc1 = nn.Linear(self.flat_dim, fc1_dim)
+        self.act2 = Swish()
         
         # --- Layer 6: Multi-task Output Heads ---
-        # 回归头：预测标准化后的RV值（输出1个标量）
-        self.fc_reg = nn.Linear(64, 1)
-        # 分类头：预测波动率是否下降（输出1个logit，用于二元分类）
-        self.fc_cls = nn.Linear(64, 1)
+        self.fc_reg = nn.Linear(fc1_dim, 1)
+        self.fc_cls = nn.Linear(fc1_dim, 1)
 
     def forward(self, x):
-        # Convolution Block
-        x = self.relu1(self.conv1(x))
-        x = self.relu2(self.conv2(x))
-        x = self.pool(x)
+        # Initial Conv
+        x = self.act1(self.bn1(self.conv1(x)))
         
-        # Regularization
+        # ResBlocks
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        
+        # Flattening
         x = self.dropout(x)
-        
-        # Flattening: (Batch, 64, 8, 8) -> (Batch, 4096)
         x = x.view(x.size(0), -1)
         
         # Dense Layers
-        x = self.relu3(self.fc1(x))
+        x = self.act2(self.fc1(x))
 
         # Multi-task Outputs
-        reg_output = self.fc_reg(x)      # 回归输出: (batch_size, 1)
-        cls_output = self.fc_cls(x)      # 分类logits: (batch_size, 1)
+        reg_output = self.fc_reg(x)      # 回归输出
+        cls_output = self.fc_cls(x)      # 分类logits
 
         return reg_output, cls_output
 
 
-def train_model(model, train_loader, test_loader, num_epochs=50, device='cpu'):
+def train_model(model, train_loader, test_loader, num_epochs=50, device='cpu', 
+                lr=0.0012836791765097324, weight_decay=1e-06):
     """
-    训练多任务CNN_HAR_KS模型的完整循环
+    训练多任务CNN_HAR_KS模型的完整循环。
+    Default hyperparameters are set to the best parameters found via Bayesian Optimization.
     """
     model = model.to(device)
 
-    # --- Hyperparameters from Paper Appendix C ---
+    # --- Hyperparameters ---
     # Optimizer: Adam (standard choice)
-    # Learning Rate: 0.001 (search space start)
-    # L2 Regularization (Weight Decay): 0.001
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 多任务损失函数
     criterion = MultiTaskLoss().to(device)

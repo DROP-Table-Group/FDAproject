@@ -452,9 +452,9 @@ def main():
                         help='输入数据路径')
     parser.add_argument('--benchmark-path', type=str, default='./data/benchmark_predictions.csv',
                         help='基准预测文件路径')
-    parser.add_argument('--n-calls', type=int, default=50,
+    parser.add_argument('--n-calls', type=int, default=100,
                         help='贝叶斯优化迭代次数')
-    parser.add_argument('--n-epochs', type=int, default=50,
+    parser.add_argument('--n-epochs', type=int, default=25,
                         help='每次训练的 epoch 数')
     parser.add_argument('--save-dir', type=str, default='./bayesian_opt_results',
                         help='结果保存目录')

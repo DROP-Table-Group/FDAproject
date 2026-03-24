@@ -27,42 +27,13 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from dataloader import create_dataloaders
-from model import MultiTaskLoss, evaluate_model, export_test_predictions # type: ignore
+from model import MultiTaskLoss, evaluate_model, export_test_predictions, CNN_HAR_KS # type: ignore
 from preprocess import calculate_daily_components, prepare_intraday_data
 
 
-class CNN_HAR_KS_Configurable(nn.Module):
-    """与贝叶斯优化脚本一致的可配置 CNN_HAR_KS 结构。"""
-
-    def __init__(self, dropout: float = 0.3, fc1_dim: int = 64):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1)
-        self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
-        self.relu2 = nn.ReLU()
-
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.dropout = nn.Dropout(p=dropout)
-
-        self.fc1 = nn.Linear(64 * 8 * 8, fc1_dim)
-        self.relu3 = nn.ReLU()
-
-        self.fc_reg = nn.Linear(fc1_dim, 1)
-        self.fc_cls = nn.Linear(fc1_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.relu1(self.conv1(x))
-        x = self.relu2(self.conv2(x))
-        x = self.pool(x)
-        x = self.dropout(x)
-
-        x = x.view(x.size(0), -1)
-        x = self.relu3(self.fc1(x))
-
-        reg_output = self.fc_reg(x)
-        cls_output = self.fc_cls(x)
-        return reg_output, cls_output
+# No longer needed as we use the optimized model from model/model.py
+# class CNN_HAR_KS_Configurable(nn.Module):
+# ...
 
 
 def set_seed(seed: int) -> None:
@@ -263,7 +234,8 @@ def main() -> None:
     print(f"训练集batch数量: {len(train_loader)}")
     print(f"测试集batch数量: {len(test_loader)}")
 
-    model = CNN_HAR_KS_Configurable(dropout=dropout, fc1_dim=fc1_dim).to(device)
+    # Use the optimized CNN_HAR_KS from model.py
+    model = CNN_HAR_KS(dropout=dropout, fc1_dim=fc1_dim).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"总参数数量: {total_params:,}")
