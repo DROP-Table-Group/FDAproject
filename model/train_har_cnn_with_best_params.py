@@ -15,21 +15,28 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from dataloader import create_dataloaders
+from preprocess import calculate_daily_components, prepare_intraday_data
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
-from dataloader import create_dataloaders
-from model import MultiTaskLoss, evaluate_model, export_test_predictions, CNN_HAR_KS # type: ignore
-from preprocess import calculate_daily_components, prepare_intraday_data
-
+from model import (
+    CNN_HAR_KS,
+    MultiTaskLoss,
+    evaluate_model,
+    export_test_predictions,
+)
 
 # No longer needed as we use the optimized model from model/model.py
 # class CNN_HAR_KS_Configurable(nn.Module):
@@ -44,7 +51,9 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float, float]:
+def compute_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> tuple[float, float, float]:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
 
@@ -55,7 +64,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, floa
     ratio = y_true / y_pred_safe
     qlike = np.mean(ratio - np.log(ratio) - 1)
 
-    return mse, mae, qlike # type: ignore
+    return mse, mae, qlike  # type: ignore
 
 
 def train_model_with_best_params(
@@ -69,7 +78,9 @@ def train_model_with_best_params(
 ) -> Dict[str, list[float]]:
     model = model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
     criterion = MultiTaskLoss().to(device)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -172,7 +183,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--best-params-path",
         type=Path,
-        default=script_dir / "bayesian_opt_results" / "best_params_20260321_190834.json",
+        default=script_dir
+        / "bayesian_opt_results"
+        / "best_params_20260323_201449.json",
         help="最优超参数 JSON 路径",
     )
     parser.add_argument("--num-epochs", type=int, default=50, help="训练轮数")
@@ -186,7 +199,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predictions-output",
         type=Path,
-        default=project_root / "data" / "cnn_har_ks_multitask_predictions_best_params.csv",
+        default=project_root
+        / "data"
+        / "cnn_har_ks_multitask_predictions_best_params.csv",
         help="预测结果输出路径",
     )
 
@@ -259,8 +274,12 @@ def main() -> None:
 
     best_epoch_cls = int(np.argmax(history["test_cls_acc"]))
     best_epoch_reg = int(np.argmin(history["test_reg_mse"]))
-    print(f"最佳测试分类准确率: {history['test_cls_acc'][best_epoch_cls]:.4f} (Epoch {best_epoch_cls + 1})")
-    print(f"最佳测试回归MSE: {history['test_reg_mse'][best_epoch_reg]:.4f} (Epoch {best_epoch_reg + 1})")
+    print(
+        f"最佳测试分类准确率: {history['test_cls_acc'][best_epoch_cls]:.4f} (Epoch {best_epoch_cls + 1})"
+    )
+    print(
+        f"最佳测试回归MSE: {history['test_reg_mse'][best_epoch_reg]:.4f} (Epoch {best_epoch_reg + 1})"
+    )
 
     args.model_output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.model_output)
@@ -316,17 +335,33 @@ def main() -> None:
     print("\n样本外误差指标:")
     print(metrics_summary.to_string(index=False))
 
-    cnn_mse = metrics_summary.loc[metrics_summary["Model"] == "CNN-HAR-KS", "MSE"].iloc[0]
-    garch_mse = metrics_summary.loc[metrics_summary["Model"] == "GARCH(1,1)", "MSE"].iloc[0]
+    cnn_mse = metrics_summary.loc[metrics_summary["Model"] == "CNN-HAR-KS", "MSE"].iloc[
+        0
+    ]
+    garch_mse = metrics_summary.loc[
+        metrics_summary["Model"] == "GARCH(1,1)", "MSE"
+    ].iloc[0]
     ewma_mse = metrics_summary.loc[metrics_summary["Model"] == "EWMA", "MSE"].iloc[0]
 
-    print(f"CNN-HAR-KS 相比 GARCH 的 MSE 改进: {(garch_mse - cnn_mse) / garch_mse * 100:.2f}%")
-    print(f"CNN-HAR-KS 相比 EWMA 的 MSE 改进: {(ewma_mse - cnn_mse) / ewma_mse * 100:.2f}%")
+    print(
+        f"CNN-HAR-KS 相比 GARCH 的 MSE 改进: {(garch_mse - cnn_mse) / garch_mse * 100:.2f}%"
+    )
+    print(
+        f"CNN-HAR-KS 相比 EWMA 的 MSE 改进: {(ewma_mse - cnn_mse) / ewma_mse * 100:.2f}%"
+    )
 
-    residual_frame = evaluation_frame[["date", "true_rv", "cnn_pred", "garch_pred", "ewma_pred"]].copy()
-    residual_frame["cnn_residual"] = residual_frame["true_rv"] - residual_frame["cnn_pred"]
-    residual_frame["garch_residual"] = residual_frame["true_rv"] - residual_frame["garch_pred"]
-    residual_frame["ewma_residual"] = residual_frame["true_rv"] - residual_frame["ewma_pred"]
+    residual_frame = evaluation_frame[
+        ["date", "true_rv", "cnn_pred", "garch_pred", "ewma_pred"]
+    ].copy()
+    residual_frame["cnn_residual"] = (
+        residual_frame["true_rv"] - residual_frame["cnn_pred"]
+    )
+    residual_frame["garch_residual"] = (
+        residual_frame["true_rv"] - residual_frame["garch_pred"]
+    )
+    residual_frame["ewma_residual"] = (
+        residual_frame["true_rv"] - residual_frame["ewma_pred"]
+    )
 
     print("\n残差 Ljung-Box 检验:")
     for label, column in [

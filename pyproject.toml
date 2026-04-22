@@ -1,0 +1,24 @@
+[project]
+name = "fdaproject"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "arch>=8.0.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "scikit-optimize>=0.10.2",
+    "statsmodels>=0.14.6",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu121"
